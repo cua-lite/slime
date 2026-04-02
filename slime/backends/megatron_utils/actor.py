@@ -192,16 +192,10 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["loss_masks"] = [
             torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
         ]
-        if "multimodal_train_inputs" in rollout_data:
-            # Move multimodal training tensors to GPU in advance
-            rollout_data["multimodal_train_inputs"] = [
-                (
-                    {key: tensor.to(device=torch.cuda.current_device()) for key, tensor in mm_dict.items()}
-                    if mm_dict is not None
-                    else None
-                )
-                for mm_dict in rollout_data["multimodal_train_inputs"]
-            ]
+        # multimodal_train_inputs (pixel_values) stay on CPU here.
+        # Moved to GPU per-micro-batch in data.py:get_batch() to avoid
+        # pre-loading all images at once (critical for multi-turn envs
+        # where num_samples >> num_episodes).
 
         if self.args.qkv_format == "bshd":
             # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator

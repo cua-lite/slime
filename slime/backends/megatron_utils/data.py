@@ -138,6 +138,12 @@ def get_batch(
                     else:
                         multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
                         multimodal_num_items[key].append(mm_tensor.size(0))
+        # Move concatenated multimodal tensors to GPU (lazy loading:
+        # pixel_values stay on CPU until this per-micro-batch collation).
+        device = torch.cuda.current_device()
+        for key in multimodal_data:
+            if not multimodal_data[key].is_cuda:
+                multimodal_data[key] = multimodal_data[key].to(device)
         batch["multimodal_train_inputs"] = multimodal_data
         batch["multimodal_num_items"] = multimodal_num_items
 
