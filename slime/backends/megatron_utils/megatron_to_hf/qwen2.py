@@ -3,6 +3,26 @@ import torch
 
 
 def convert_qwen2_to_hf(args, name, param):
+    # --- VLM support (Qwen3-VL) ---
+    # Vision model: passthrough with prefix rename
+    vision_prefix = "module.module.vision_model."
+    if name.startswith(vision_prefix):
+        hf_name = "visual." + name[len(vision_prefix):]
+        return [(hf_name, param)]
+
+    # VLM wraps LLM in language_model.*; strip prefix and reuse LLM conversion
+    # (SGLang internally maps language_model.* → model.* so we output model.* names)
+    lm_prefix = "module.module.language_model."
+    if name.startswith(lm_prefix):
+        inner = name[len(lm_prefix):]  # e.g. "embedding.word_embeddings.weight"
+        return _convert_qwen2_llm_to_hf(args, "module.module." + inner, param)
+
+    # --- Pure Qwen2 (no VLM wrapper) ---
+    return _convert_qwen2_llm_to_hf(args, name, param)
+
+
+def _convert_qwen2_llm_to_hf(args, name, param):
+    """Convert Megatron LLM parameter names to HF format (model.* prefix)."""
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
