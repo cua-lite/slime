@@ -583,107 +583,120 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    num_inner_epochs = getattr(args, "num_inner_epochs", 1)
+    total_steps_per_rollout = num_steps_per_rollout * num_inner_epochs
 
     # Run training iterations till done.
-    for step_id in range(num_steps_per_rollout):
+    for inner_epoch in range(num_inner_epochs):
+        # Reset data iterators at the start of each inner epoch so the same
+        # rollout data is replayed.  The old log-probs stored in rollout_data
+        # (ratio denominator) remain unchanged across inner epochs.
+        if inner_epoch > 0:
+            for iterator in data_iterator:
+                iterator.reset()
 
-        # Run training step.
-        loss_dict, grad_norm = train_one_step(
-            args,
-            rollout_id,
-            step_id,
-            data_iterator,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_microbatches[step_id],
-        )
+        for step_id in range(num_steps_per_rollout):
+            global_step_id = inner_epoch * num_steps_per_rollout + step_id
 
-        if step_id == 0:
-            # Enable forward pre-hook after training step has successfully run. All subsequent
-            # forward passes will use the forward pre-hook / `param_sync_func` in
-            # `forward_backward_func`.
-            if should_disable_forward_pre_hook(args):
-                enable_forward_pre_hook(model)
-                config.param_sync_func = param_sync_func
-                pre_hook_enabled = True
+            # Run training step.
+            loss_dict, grad_norm = train_one_step(
+                args,
+                rollout_id,
+                global_step_id,
+                data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_microbatches[step_id],
+            )
 
-        if args.enable_mtp_training:
-            from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+            if inner_epoch == 0 and step_id == 0:
+                # Enable forward pre-hook after training step has successfully run. All subsequent
+                # forward passes will use the forward pre-hook / `param_sync_func` in
+                # `forward_backward_func`.
+                if should_disable_forward_pre_hook(args):
+                    enable_forward_pre_hook(model)
+                    config.param_sync_func = param_sync_func
+                    pre_hook_enabled = True
 
-            mtp_loss_scale = 1 / num_microbatches[step_id]
-            tracker = MTPLossLoggingHelper.tracker
-            if "values" in tracker:
-                values = tracker["values"]
-                if tracker.get("reduce_group") is not None:
-                    torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
-                if tracker.get("avg_group") is not None:
-                    torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-                # here we assume only one mtp layer
-                mtp_losses = (tracker["values"] * mtp_loss_scale).item()
-                MTPLossLoggingHelper.clean_loss_in_tracker()
-
-                # CI check: verify MTP loss is within expected bounds
-                if args.ci_test:
-                    from slime.backends.megatron_utils.ci_utils import check_mtp_loss
-
-                    check_mtp_loss(mtp_losses)
-
-        # per train step log.
-        if (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-            and mpu.get_tensor_model_parallel_rank() == 0
-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-        ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
-            role = getattr(model[0], "role", "actor")
-            role_tag = "" if role == "actor" else f"{role}-"
-            log_dict = {
-                f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
-                for key, val in loss_dict.items()
-            }
-            log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
-                log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+                from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
-            for param_group_id, param_group in enumerate(optimizer.param_groups):
-                log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+                mtp_loss_scale = 1 / num_microbatches[step_id]
+                tracker = MTPLossLoggingHelper.tracker
+                if "values" in tracker:
+                    values = tracker["values"]
+                    if tracker.get("reduce_group") is not None:
+                        torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
+                    if tracker.get("avg_group") is not None:
+                        torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
+                    # here we assume only one mtp layer
+                    mtp_losses = (tracker["values"] * mtp_loss_scale).item()
+                    MTPLossLoggingHelper.clean_loss_in_tracker()
 
-            log_dict["train/step"] = accumulated_step_id
-            logging_utils.log(args, log_dict, step_key="train/step")
+                    # CI check: verify MTP loss is within expected bounds
+                    if args.ci_test:
+                        from slime.backends.megatron_utils.ci_utils import check_mtp_loss
 
-            if args.ci_test and not args.ci_disable_kl_checker:
-                if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
-                    if args.multi_latent_attention:
-                        # TODO: mla currently have non-zero kl, need further investigation
-                        assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
-                    else:
-                        assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
-                if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
-                    assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
+                        check_mtp_loss(mtp_losses)
 
-            logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+            # per train step log.
+            if (
+                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+                and mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+            ):
+                accumulated_step_id = rollout_id * total_steps_per_rollout + global_step_id
+                role = getattr(model[0], "role", "actor")
+                role_tag = "" if role == "actor" else f"{role}-"
+                log_dict = {
+                    f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+                    for key, val in loss_dict.items()
+                }
+                log_dict[f"train/{role_tag}grad_norm"] = grad_norm
+                if num_inner_epochs > 1:
+                    log_dict[f"train/{role_tag}inner_epoch"] = inner_epoch
+                if args.enable_mtp_training:
+                    log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
 
-            if args.ci_save_grad_norm is not None:
-                ci_save_grad_norm_path = args.ci_save_grad_norm.format(
-                    role=role,
-                    rollout_id=rollout_id,
-                    step_id=step_id,
-                )
-                torch.save(grad_norm, ci_save_grad_norm_path)
-            elif args.ci_load_grad_norm is not None:
-                ci_load_grad_norm_path = args.ci_load_grad_norm.format(
-                    role=role,
-                    rollout_id=rollout_id,
-                    step_id=step_id,
-                )
-                expected_grad_norm = torch.load(ci_load_grad_norm_path)
-                assert math.isclose(
-                    grad_norm,
-                    expected_grad_norm,
-                    rel_tol=0.01,
-                    abs_tol=0.01,
-                ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
+                for param_group_id, param_group in enumerate(optimizer.param_groups):
+                    log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+
+                log_dict["train/step"] = accumulated_step_id
+                logging_utils.log(args, log_dict, step_key="train/step")
+
+                if args.ci_test and not args.ci_disable_kl_checker:
+                    if global_step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
+                        if args.multi_latent_attention:
+                            # TODO: mla currently have non-zero kl, need further investigation
+                            assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
+                        else:
+                            assert log_dict["train/ppo_kl"] == 0.0 and log_dict["train/pg_clipfrac"] == 0.0, f"{log_dict=}"
+                    if accumulated_step_id == 0 and "train/kl_loss" in log_dict:
+                        assert log_dict["train/kl_loss"] == 0.0, f"{log_dict=}"
+
+                logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
+
+                if args.ci_save_grad_norm is not None:
+                    ci_save_grad_norm_path = args.ci_save_grad_norm.format(
+                        role=role,
+                        rollout_id=rollout_id,
+                        step_id=global_step_id,
+                    )
+                    torch.save(grad_norm, ci_save_grad_norm_path)
+                elif args.ci_load_grad_norm is not None:
+                    ci_load_grad_norm_path = args.ci_load_grad_norm.format(
+                        role=role,
+                        rollout_id=rollout_id,
+                        step_id=global_step_id,
+                    )
+                    expected_grad_norm = torch.load(ci_load_grad_norm_path)
+                    assert math.isclose(
+                        grad_norm,
+                        expected_grad_norm,
+                        rel_tol=0.01,
+                        abs_tol=0.01,
+                    ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)

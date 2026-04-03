@@ -733,6 +733,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
             parser.add_argument(
+                "--num-inner-epochs",
+                type=int,
+                default=1,
+                help=(
+                    "Number of inner training epochs per rollout batch. "
+                    "When > 1, the same rollout data is trained on multiple times with "
+                    "the ratio denominator (old log-probs) fixed from the initial computation. "
+                    "Similar to PPO's multiple mini-batch passes."
+                ),
+            )
+            parser.add_argument(
                 "--eps-clip-c",
                 type=float,
                 default=None,
