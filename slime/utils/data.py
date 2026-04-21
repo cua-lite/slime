@@ -52,7 +52,7 @@ def read_file(path):
         def parquet_reader(p):
             pf = pq.ParquetFile(p)
 
-            for batch in pf.iter_batches():
+            for batch in pf.iter_batches(batch_size=4096):
                 yield from batch.to_pylist()
 
         reader = parquet_reader(path)
