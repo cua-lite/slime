@@ -1,6 +1,96 @@
+"""
+Convert Qwen3.5 model parameters from Megatron to HuggingFace format.
+
+Called by slime's ``--megatron-to-hf-mode raw`` path.  When using
+``--megatron-to-hf-mode bridge`` the Bridge ``mapping_registry`` handles
+weight conversion instead, so this file is only needed for raw-mode export
+and debugging.
+"""
+
 import re
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# Native GDN weight conversion helpers (raw-mode export)
+# ---------------------------------------------------------------------------
+# These mirror the logic in megatron.bridge's split_gdn_linear_weights and
+# _split_gdn_grouped_to_separate, inlined here so raw-mode export works
+# without the Bridge fork installed.
+# ---------------------------------------------------------------------------
+
+def _split_in_proj_to_hf(args, in_proj: torch.Tensor, prefix: str):
+    """Split native Megatron fused in_proj into 4 separate HF tensors.
+
+    in_proj layout (after TP gather): head-grouped across tp_size shards,
+    each shard = [q_heads_r, k_heads_r, v_heads_r, z_heads_r, b_heads_r, a_heads_r].
+    """
+    hidden_size = args.hidden_size
+    qk_head_dim = args.linear_key_head_dim if hasattr(args, "linear_key_head_dim") else 128
+    v_head_dim = args.linear_value_head_dim if hasattr(args, "linear_value_head_dim") else 128
+    num_qk_heads = args.linear_num_key_heads if hasattr(args, "linear_num_key_heads") else 16
+    num_v_heads = args.linear_num_value_heads if hasattr(args, "linear_num_value_heads") else 32
+    tp_size = args.tensor_model_parallel_size if hasattr(args, "tensor_model_parallel_size") else 1
+
+    qk_dim_per_tp = qk_head_dim * (num_qk_heads // tp_size)
+    v_dim_per_tp = v_head_dim * (num_v_heads // tp_size)
+    nv_per_tp = num_v_heads // tp_size
+
+    # Reshape to (tp_size, per_tp_rows, hidden)
+    in_proj_t = in_proj.reshape(tp_size, -1, hidden_size)
+    q_t, k_t, v_t, z_t, b_t, a_t = torch.split(
+        in_proj_t,
+        [qk_dim_per_tp, qk_dim_per_tp, v_dim_per_tp, v_dim_per_tp, nv_per_tp, nv_per_tp],
+        dim=1,
+    )
+
+    # Reshape to (num_heads, per_head_dim, hidden) and flatten to (total_dim, hidden)
+    q = q_t.reshape(num_qk_heads, qk_head_dim, hidden_size).reshape(-1, hidden_size)
+    k = k_t.reshape(num_qk_heads, qk_head_dim, hidden_size).reshape(-1, hidden_size)
+    v = v_t.reshape(num_v_heads, v_head_dim, hidden_size).reshape(-1, hidden_size)
+    z = z_t.reshape(num_v_heads, v_head_dim, hidden_size).reshape(-1, hidden_size)
+    b = b_t.reshape(num_v_heads, hidden_size)
+    a = a_t.reshape(num_v_heads, hidden_size)
+
+    qkv = torch.cat([q, k, v], dim=0)
+    return [
+        (f"{prefix}.linear_attn.in_proj_qkv.weight", qkv),
+        (f"{prefix}.linear_attn.in_proj_z.weight", z),
+        (f"{prefix}.linear_attn.in_proj_b.weight", b),
+        (f"{prefix}.linear_attn.in_proj_a.weight", a),
+    ]
+
+
+def _split_conv1d_to_hf(args, conv1d: torch.Tensor, prefix: str):
+    """Convert head-grouped Megatron conv1d back to flat HF conv1d.
+
+    conv1d shape: (conv_dim, 1, kernel_size) where conv_dim = qk_dim*2 + v_dim,
+    stored in head-grouped TP layout.
+    """
+    qk_head_dim = args.linear_key_head_dim if hasattr(args, "linear_key_head_dim") else 128
+    v_head_dim = args.linear_value_head_dim if hasattr(args, "linear_value_head_dim") else 128
+    num_qk_heads = args.linear_num_key_heads if hasattr(args, "linear_num_key_heads") else 16
+    num_v_heads = args.linear_num_value_heads if hasattr(args, "linear_num_value_heads") else 32
+    tp_size = args.tensor_model_parallel_size if hasattr(args, "tensor_model_parallel_size") else 1
+
+    qk_dim = qk_head_dim * num_qk_heads
+    v_dim = v_head_dim * num_v_heads
+    kernel_size = conv1d.shape[-1]
+
+    # Head-grouped layout: (tp_size, [q+k+v]_per_tp, 1, kernel)
+    qk_per_tp = qk_dim // tp_size
+    v_per_tp = v_dim // tp_size
+    conv1d_t = conv1d.reshape(tp_size, qk_per_tp + qk_per_tp + v_per_tp, 1, kernel_size)
+    q_c, k_c, v_c = torch.split(conv1d_t, [qk_per_tp, qk_per_tp, v_per_tp], dim=1)
+
+    # Flatten to (qk_dim, 1, k), (qk_dim, 1, k), (v_dim, 1, k)
+    q_c = q_c.reshape(qk_dim, 1, kernel_size)
+    k_c = k_c.reshape(qk_dim, 1, kernel_size)
+    v_c = v_c.reshape(v_dim, 1, kernel_size)
+    flat = torch.cat([q_c, k_c, v_c], dim=0)
+
+    return [(f"{prefix}.linear_attn.conv1d.weight", flat)]
 
 
 def _convert_mtp_layer(args, name, param, layer_idx):
@@ -36,7 +126,25 @@ def convert_qwen3_5_to_hf(args, name, param):
 
     Qwen3.5 uses model.language_model.layers prefix and has separate
     in_proj_qkv, in_proj_z, in_proj_b, in_proj_a for linear attention.
+
+    VLM wrapper handling (mirrors ``qwen3_vl.convert_qwen3vl_to_hf``): when
+    the Qwen3.5 VL model wraps ``GPTModel`` inside ``self.language_model`` and
+    adds a frozen ``vision_model``, mcore's named_parameters emit
+    ``module.module.language_model.<rest>`` and ``module.module.vision_model.<rest>``.
+    Strip the ``language_model.`` infix so the rest of the converter matches
+    against the plain ``module.module.<rest>`` paths it was originally written
+    for, and route ``vision_model.*`` directly to ``model.visual.*``.
     """
+    if name.startswith("module.module.language_model."):
+        name = "module.module." + name[len("module.module.language_model.") :]
+
+    while name.startswith("module.module.module."):
+        name = name.replace("module.module.module.", "module.module.", 1)
+
+    if name.startswith("module.module.vision_model."):
+        hf_name = "model.visual." + name[len("module.module.vision_model.") :]
+        return [(hf_name, param)]
+
     # Handle MTP layers
     if "mtp.layers" in name:
         parts = name.split(".")
@@ -167,27 +275,27 @@ def convert_qwen3_5_to_hf(args, name, param):
             return [(f"{prefix}.self_attn.q_norm.weight", param)]
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"{prefix}.self_attn.k_norm.weight", param)]
-        elif rest.startswith("self_attention.") and rest[len("self_attention.") :] in [
-            "input_layernorm.weight",
-            # linear attn (Qwen3.5 uses separate in_proj_b/in_proj_a)
-            "linear_attn.A_log",
-            "linear_attn.conv1d.weight",
-            "linear_attn.dt_bias",
-            "linear_attn.in_proj_a.weight",
-            "linear_attn.in_proj_b.weight",
-            "linear_attn.in_proj_qkv.weight",
-            "linear_attn.in_proj_z.weight",
-            "linear_attn.norm.weight",
-            "linear_attn.out_proj.weight",
-            # gated attn (full attention layers)
-            "self_attn.k_norm.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.o_proj.weight",
-            "self_attn.q_norm.weight",
-            "self_attn.q_proj.weight",
-            "self_attn.v_proj.weight",
-        ]:
-            rest = rest[len("self_attention.") :]
-            return [(f"{prefix}.{rest}", param)]
+
+        # Native GDN (Gated DeltaNet) parameters
+        elif rest == "self_attention.in_proj.layer_norm_weight":
+            return [(f"{prefix}.input_layernorm.weight", param)]
+        elif rest == "self_attention.A_log":
+            return [(f"{prefix}.linear_attn.A_log", param)]
+        elif rest == "self_attention.dt_bias":
+            return [(f"{prefix}.linear_attn.dt_bias", param)]
+        elif rest == "self_attention.out_proj.weight":
+            return [(f"{prefix}.linear_attn.out_proj.weight", param)]
+        elif rest == "self_attention.out_norm.weight":
+            # GDN out_norm: keep raw export consistent with bridge mode, which
+            # currently uses plain AutoMapping (no ±1 offset). See the comment
+            # in slime/slime_plugins/megatron_bridge/qwen3_5.py around the
+            # `out_norm.weight` mapping for the open question.
+            return [(f"{prefix}.linear_attn.norm.weight", param)]
+        elif rest == "self_attention.in_proj.weight":
+            # Fused head-grouped in_proj → 4 separate HF tensors.
+            return _split_in_proj_to_hf(args, param, prefix)
+        elif rest == "self_attention.conv1d.weight":
+            # Head-grouped conv1d → flat HF conv1d.
+            return _split_conv1d_to_hf(args, param, prefix)
 
     raise ValueError(f"Unknown parameter name: {name}")
