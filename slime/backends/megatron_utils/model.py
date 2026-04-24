@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -729,6 +730,7 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
     try:
         from megatron.bridge import AutoBridge
+        from megatron.bridge.models.conversion import model_bridge as _mb
 
         from slime.utils.megatron_bridge_utils import patch_megatron_model
 
@@ -742,16 +744,100 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         path.mkdir(parents=True, exist_ok=True)
 
         with patch_megatron_model(model):
-            bridge.save_hf_pretrained(
-                model,
-                path=path,
+            # Bridge mappings can yield non-contiguous tensors (split / transpose
+            # results). safetensors.save_file -> _end_ptr -> tensor.view(-1)
+            # then crashes with "view size is not compatible with input tensor's
+            # size and stride". Inline the upstream save_hf_pretrained body and
+            # wrap the streaming generator to .contiguous() each tensor.
+            #
+            # Equivalent to:
+            #   bridge.save_hf_pretrained(model, path=path)
+            from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource
+            if dist.is_available() and dist.is_initialized():
+                if dist.get_rank() == 0:
+                    bridge.hf_pretrained.save_artifacts(path, original_source_path=None)
+                dist.barrier()
+            else:
+                bridge.hf_pretrained.save_artifacts(path, original_source_path=None)
+
+            dispatch_instance = (
+                bridge._causal_lm_architecture,
+                bridge._get_model_instance(model),
             )
+            raw_gen = _mb.stream_weights_megatron_to_hf(
+                dispatch_instance,
+                model,
+                bridge.hf_pretrained,
+                cpu=True,
+                show_progress=False,
+            )
+
+            def _contiguous_generator(g):
+                for item in g:
+                    w = item.weight
+                    if isinstance(w, torch.Tensor) and not w.is_contiguous():
+                        item = type(item)(
+                            param_name=item.param_name,
+                            weight=w.contiguous(),
+                            megatron_param_name=item.megatron_param_name,
+                        )
+                    yield item
+
+            state_source = bridge.hf_pretrained.state.source
+            assert isinstance(state_source, SafeTensorsStateSource), (
+                f"unexpected state source type: {type(state_source)}; "
+                "save_generator only supports SafeTensorsStateSource"
+            )
+
+            # Pass-through HF tensors that exist in the source ckpt but the
+            # Megatron model doesn't carry (e.g. Qwen3.5 MTP head). Without this
+            # save_generator(strict=True) drops the entire shard when ANY
+            # expected tensor is missing, even if the other 600+ are correct.
+            from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
+            yielded_keys = set()
+            def _passthrough_generator(g):
+                for item in g:
+                    yielded_keys.add(item.param_name)
+                    yield item
+                # After the bridge has yielded everything, fill in any source
+                # tensors it skipped (MTP, etc.).
+                try:
+                    src_keys = set(state_source.get_all_keys())
+                except Exception:
+                    return
+                missing = sorted(src_keys - yielded_keys)
+                if not missing:
+                    return
+                if should_log:
+                    logger.info(
+                        f"[save] pass-through {len(missing)} unmapped HF tensors "
+                        f"from source (e.g. {missing[:3]})"
+                    )
+                tensors = state_source.load_tensors(missing)
+                for key in missing:
+                    t = tensors[key]
+                    if isinstance(t, torch.Tensor):
+                        t = t.cpu()
+                        if not t.is_contiguous():
+                            t = t.contiguous()
+                    yield HFWeightTuple(param_name=key, weight=t, megatron_param_name=key)
+
+            state_source.save_generator(
+                _passthrough_generator(_contiguous_generator(raw_gen)),
+                path,
+                strict=True,
+            )
+
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
 
         if should_log:
             logger.info(f"Successfully saved HuggingFace model to {path}")
     except Exception as e:
         if should_log:
-            logger.error(f"Failed to save HuggingFace format: {e}")
+            import traceback
+            logger.error(f"Failed to save HuggingFace format: {e}\n{traceback.format_exc()}")
+        raise
 
 
 def initialize_model_and_optimizer(
