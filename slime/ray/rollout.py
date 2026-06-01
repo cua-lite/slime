@@ -744,6 +744,16 @@ class RolloutManager:
         if any(sample.multimodal_train_inputs is not None for sample in samples):
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
 
+        # Lazy multimodal payloads, materialized once per RL iter on the
+        # train side by ``slime.utils.data.materialize_lazy_payloads`` (called
+        # from ``actor._get_rollout_data`` before any DataIterator slices
+        # micro-batches). Mutually exclusive with multimodal_train_inputs
+        # per-Sample — enforcement lives in materialize_lazy_payloads.
+        if any(sample.multimodal_lazy_payloads is not None for sample in samples):
+            train_data["multimodal_lazy_payloads"] = [
+                sample.multimodal_lazy_payloads for sample in samples
+            ]
+
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
@@ -776,6 +786,7 @@ class RolloutManager:
             for key in [
                 "tokens",
                 "multimodal_train_inputs",
+                "multimodal_lazy_payloads",
                 "response_lengths",
                 "rewards",
                 "truncated",

@@ -160,6 +160,13 @@ def get_batch(
     assert loss_masks.shape == tokens.shape, f"loss_masks.shape: {loss_masks.shape}, tokens.shape: {tokens.shape}"
     batch["full_loss_masks"] = loss_masks
 
+    # ``multimodal_lazy_payloads`` (rollout-side staging form, e.g. PNG
+    # bytes) has already been hydrated into ``multimodal_train_inputs``
+    # on the train side — once per RL iter — inside
+    # ``actor._get_rollout_data`` via ``materialize_lazy_payloads``. By
+    # the time we get here, only ``multimodal_train_inputs`` should be
+    # present; the lazy key was deleted at hydrate time.
+
     # Process multimodal training tensors if present
     multimodal_train_inputs = batch.get("multimodal_train_inputs", None)
     if multimodal_train_inputs is not None:

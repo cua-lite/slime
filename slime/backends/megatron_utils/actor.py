@@ -16,7 +16,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
-from slime.utils.data import process_rollout_data
+from slime.utils.data import materialize_lazy_payloads, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
@@ -193,6 +193,13 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
+        # Hydrate ``multimodal_lazy_payloads`` (rollout-side staging form,
+        # e.g. PNG-encoded bytes that ray.put dedup'd across Samples)
+        # into the standard ``multimodal_train_inputs`` shape — exactly
+        # once per RL iter, before any DataIterator slices micro-batches
+        # for log_probs / train. No-op when the rollout didn't stage
+        # any lazy payloads (legacy / lazy=off path).
+        materialize_lazy_payloads(self.args, rollout_data)
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         rollout_data["tokens"] = [

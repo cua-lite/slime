@@ -16,6 +16,17 @@ class Sample:
     tokens: list[int] = field(default_factory=list)
     multimodal_inputs: dict[str, Any] | None = None  # raw multimodal data, e.g. images, videos, etc.
     multimodal_train_inputs: dict[str, Any] | None = None  # processed multimodal data, e.g. pixel_values, etc.
+    # Lazy-form multimodal payloads, materialized into multimodal_train_inputs
+    # once per RL iter by ``slime.utils.data.materialize_lazy_payloads``
+    # (called from ``actor._get_rollout_data`` before any DataIterator setup;
+    # expand fn resolved from ``args.multimodal_lazy_expand_fn_path``). The
+    # rollout actor stages cross-Sample shared per-trajectory image refs +
+    # per-Sample index views; ray dedups shared identities at ``ray.put`` so
+    # plasma carries 1× per trajectory instead of K× per Sample. Mutually
+    # exclusive with multimodal_train_inputs per-Sample (enforced in
+    # materialize_lazy_payloads). Shape contract:
+    # ``{"images": dict[int, {"image_data": uint8_tensor}], "indices": tuple[int, ...]}``.
+    multimodal_lazy_payloads: dict[str, Any] | None = None
     # response
     response: str = ""
     response_length: int = 0
