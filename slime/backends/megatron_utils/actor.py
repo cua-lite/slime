@@ -4,7 +4,6 @@ import random
 from argparse import Namespace
 from contextlib import nullcontext
 
-import numpy as np
 import ray
 import torch
 import torch.distributed as dist
@@ -14,7 +13,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
-from slime.utils.data import process_rollout_data
+from slime.utils.data import materialize_lazy_payloads, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
@@ -214,6 +213,12 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
+        # Hydrate ``multimodal_lazy_payloads`` (rollout-side staging form,
+        # e.g. PNG-encoded bytes that ray.put dedup'd across Samples) into the
+        # standard ``multimodal_train_inputs`` shape — exactly once per RL iter,
+        # before any DataIterator slices micro-batches for log_probs / train.
+        # No-op when the rollout didn't stage any lazy payloads (legacy path).
+        materialize_lazy_payloads(self.args, rollout_data)
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         rollout_data["tokens"] = [
@@ -228,23 +233,10 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data["group_mask_sums"] = torch.tensor(
                 rollout_data["group_mask_sums"], dtype=torch.float32, device=torch.cuda.current_device()
             )
-        if "multimodal_train_inputs" in rollout_data:
-            # Move multimodal training tensors to GPU in advance
-            rollout_data["multimodal_train_inputs"] = [
-                (
-                    {
-                        key: (
-                            torch.from_numpy(v.copy()).to(device=torch.cuda.current_device())
-                            if isinstance(v, np.ndarray)
-                            else v.to(device=torch.cuda.current_device())
-                        )
-                        for key, v in mm_dict.items()
-                    }
-                    if mm_dict is not None
-                    else None
-                )
-                for mm_dict in rollout_data["multimodal_train_inputs"]
-            ]
+        # multimodal_train_inputs (pixel_values) stay on CPU here. Moved to GPU
+        # per-micro-batch in data.py:get_batch() to avoid pre-loading all images
+        # at once (critical for multi-turn envs where num_samples >> num_episodes).
+        # Any np.ndarray conversion happens lazily in data.py as well.
 
         if self.args.qkv_format == "bshd":
             # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator

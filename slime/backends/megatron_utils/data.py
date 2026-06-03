@@ -171,6 +171,18 @@ def get_batch(
                         multimodal_data[key] = mm_tensor
                     else:
                         multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
+        # Lazy-load: multimodal_train_inputs (e.g. pixel_values) stay on CPU
+        # from ingest (actor._get_rollout_data no longer pre-moves them) until
+        # this per-micro-batch collation, then move to GPU together. Avoids
+        # pre-loading all images into GPU memory at once (critical for
+        # multi-turn envs where num_samples >> num_episodes).
+        device = torch.cuda.current_device()
+        for key, val in list(multimodal_data.items()):
+            if isinstance(val, np.ndarray):
+                val = torch.from_numpy(val.copy())
+            if not val.is_cuda:
+                val = val.to(device)
+            multimodal_data[key] = val
         batch["multimodal_train_inputs"] = multimodal_data
 
     return batch

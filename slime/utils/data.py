@@ -294,3 +294,76 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
     return rollout_data
+
+
+def materialize_lazy_payloads(args, rollout_data: dict, max_workers: int = 16) -> None:
+    """One-shot, in-place hydrate of ``multimodal_lazy_payloads``.
+
+    Called by the train actor once per RL iter (in ``_get_rollout_data``),
+    after ``process_rollout_data`` returns and before any phase
+    (log_probs / train / inner grpo_iter) builds a ``DataIterator``.
+
+    Before:
+        rollout_data["multimodal_lazy_payloads"] = [payload_or_None, ...]
+        rollout_data["multimodal_train_inputs"]  = None | [None, ...]
+    After:
+        rollout_data["multimodal_train_inputs"]  = [materialized_or_None, ...]
+        ``multimodal_lazy_payloads`` key removed.
+
+    Why one-shot here instead of in ``get_batch``:
+    ``get_batch`` is called per micro-batch per phase (log_probs sweep +
+    every grpo_iter inner train step's micro-batches). The same payload
+    would be re-expanded N times per RL iter. Calling once at ingestion
+    means each payload is expanded exactly once, and the work
+    parallelizes naturally across samples (PIL + image_processor release
+    the GIL, so threads run concurrently).
+
+    Args:
+        args: slime args namespace; reads ``multimodal_lazy_expand_fn_path``
+            (the dotted path to the user's expand hook).
+        rollout_data: the dict returned by ``process_rollout_data``.
+        max_workers: thread pool size for parallel per-sample expand.
+            16 saturates a 256-sample batch's overlap well without
+            piling cores; tune via call site if needed.
+
+    No-op when the rollout produced no lazy payloads.
+    """
+    lazy_payloads = rollout_data.get("multimodal_lazy_payloads", None)
+    if lazy_payloads is None:
+        return
+
+    existing = rollout_data.get("multimodal_train_inputs")
+    if existing is not None:
+        assert all(x is None for x in existing), (
+            "Sample carries BOTH multimodal_lazy_payloads AND a non-None "
+            "multimodal_train_inputs — mutually exclusive by convention; "
+            "rollout-side producer bug"
+        )
+
+    assert getattr(args, "multimodal_lazy_expand_fn_path", None), (
+        "rollout_data carries multimodal_lazy_payloads but "
+        "--multimodal-lazy-expand-fn-path was not provided."
+    )
+    from slime.utils.misc import load_function
+
+    try:
+        expand_fn = load_function(args.multimodal_lazy_expand_fn_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to resolve --multimodal-lazy-expand-fn-path="
+            f"{args.multimodal_lazy_expand_fn_path!r}. Verify the dotted "
+            f"path points to an importable callable. Underlying error: {e}"
+        ) from e
+
+    n = len(lazy_payloads)
+    workers = min(max_workers, max(1, n))
+    if workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            materialized = list(ex.map(lambda p: expand_fn(p, args=args), lazy_payloads))
+    else:
+        materialized = [expand_fn(p, args=args) for p in lazy_payloads]
+
+    rollout_data["multimodal_train_inputs"] = materialized
+    del rollout_data["multimodal_lazy_payloads"]
