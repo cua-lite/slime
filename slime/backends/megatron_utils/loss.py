@@ -960,6 +960,43 @@ def policy_loss_function(
     else:
         pg_loss_reducer = sum_of_sample_mean
 
+    # Per-token diagnostics — captured BEFORE reductions so ppo_kl / pg_loss /
+    # advantages are still per-token tensors. ratio = exp(-ppo_kl) is the raw
+    # importance ratio per token. Keys with "clip/" prefix auto-group in wandb
+    # under a single dashboard panel:
+    #   clip/pg_pos_frac:        A>0, ratio > 1+eps_clip_high  (PPO clip fires, +A side)
+    #   clip/pg_neg_frac:        A<0, ratio < 1-eps_clip       (PPO clip fires, -A side)
+    #   clip/ppo_blindspot_frac: A<0, ratio > 1+eps_clip_high  (PPO leaves this unclipped)
+    #   clip/dual_clip_frac:     A<0, ratio > eps_clip_c       (dual-clip cap fully engaged)
+    with torch.no_grad():
+        _ratio = (-ppo_kl).exp()
+        diag = {
+            "ratio_max": _ratio.max().detach(),
+            "ratio_mean": sum_of_sample_mean(_ratio).detach(),
+            "adv_abs_max": advantages.abs().max().detach(),
+            "clip/pg_pos_frac": sum_of_sample_mean(
+                ((_ratio > 1 + args.eps_clip_high) & (advantages > 0)).float()
+            ).detach(),
+            "clip/pg_neg_frac": sum_of_sample_mean(
+                ((_ratio < 1 - args.eps_clip) & (advantages < 0)).float()
+            ).detach(),
+            "clip/ppo_blindspot_frac": sum_of_sample_mean(
+                ((_ratio > 1 + args.eps_clip_high) & (advantages < 0)).float()
+            ).detach(),
+        }
+        if args.eps_clip_c is not None:
+            diag["clip/dual_clip_frac"] = sum_of_sample_mean(
+                ((_ratio > args.eps_clip_c) & (advantages < 0)).float()
+            ).detach()
+
+        # Numerical health: catch NaN/Inf in the loss-critical tensors.
+        # Any non-zero here means we are silently NaN-poisoning the optimizer.
+        diag["nan_inf_count"] = (
+            (~torch.isfinite(pg_loss)).sum()
+            + (~torch.isfinite(_ratio)).sum()
+            + (~torch.isfinite(advantages)).sum()
+        ).detach()
+
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
@@ -1002,6 +1039,7 @@ def policy_loss_function(
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
+        **diag,
     }
 
     if train_rollout_logprob_abs_diff is not None:
