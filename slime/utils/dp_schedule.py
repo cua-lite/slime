@@ -215,3 +215,90 @@ def build_dp_schedule(
                 micro_batch_indices[r].append(list(range(local_start, local_start + len(mbs_locals))))
 
     return partitions, micro_batch_indices, num_microbatches, global_batch_sizes
+
+
+#: Per-sample-list fillers for :func:`pad_static_groups` dummy rows. Each
+#: callable receives the index of the group's FIRST real row and returns the
+#: dummy's value for that key. Keys absent from the train-data dict are
+#: simply skipped; a per-sample key present in the dict but missing here
+#: raises (extend the map rather than guessing a neutral value).
+_STATIC_PAD_FILLERS: dict[str, Any] = {
+    "tokens": lambda data, i: [0, 0],  # 1 prompt + 1 response token
+    "response_lengths": lambda data, i: 1,
+    "loss_masks": lambda data, i: [0],  # zero gradient
+    "rewards": lambda data, i: 0.0,
+    "truncated": lambda data, i: 0,
+    "sample_indices": lambda data, i: data["sample_indices"][i],
+    "group_ids": lambda data, i: data["group_ids"][i],
+    # The dummy's mask sum is 0, so the group's total is unchanged — reuse it.
+    "group_mask_sums": lambda data, i: data["group_mask_sums"][i],
+    "rollout_log_probs": lambda data, i: [0.0],
+    "teacher_log_probs": lambda data, i: [0.0],
+    "multimodal_train_inputs": lambda data, i: None,
+    "multimodal_lazy_payloads": lambda data, i: None,
+    "rollout_routed_experts": lambda data, i: None,
+    "prompt": lambda data, i: data["prompt"][i],
+    "round_number": lambda data, i: data["round_number"][i],
+    "metadata": lambda data, i: None,
+}
+
+#: Keys that are per-sample-length in some converters but consumed WHOLE with
+#: their own shape contract — never padded. (``raw_reward`` feeds pass-rate
+#: logging's ``[rollout_batch_size, n_samples_per_prompt]`` reshape.)
+_STATIC_PAD_SKIP = {"raw_reward"}
+
+
+def pad_static_groups(args: Any, train_parallel_config: dict, data: dict) -> None:
+    """Pad every group in ``data`` IN PLACE with zero-loss dummy rows so its
+    sample count is a multiple of ``dp_size * micro_batch_size * mb_group``.
+
+    The STATIC (fixed ``micro_batch_size``) path of :func:`build_dp_schedule`
+    can neither split nor merge bins, so per-step micro-batch alignment must
+    hold in the data itself; padding per GROUP keeps any whole-group step
+    composition aligned. Dummy rows share their group's id (same training
+    step, same loss group) and carry ``loss_mask=[0]`` — zero gradient, and
+    the group's ``group_mask_sums`` denominator is unchanged.
+
+    No-op on the dynamic path (elastic bins split/merge to align — see
+    ``expand_bins_by_splitting`` / ``merge_bins_down``) and at
+    ``dp * micro_batch_size * mb_group == 1``.
+    """
+    if getattr(args, "use_dynamic_batch_size", False):
+        return
+    dp_size = train_parallel_config["dp_size"]
+    vpp_size = train_parallel_config["vpp_size"]
+    mb_group = train_parallel_config["microbatch_group_size_per_vp_stage"] if vpp_size > 1 else 1
+    unit = dp_size * (getattr(args, "micro_batch_size", 1) or 1) * mb_group
+    if unit <= 1:
+        return
+
+    group_ids = data["group_ids"]
+    n = len(group_ids)
+    counts: dict[int, int] = {}
+    first_row: dict[int, int] = {}
+    for i, gid in enumerate(group_ids):
+        counts[gid] = counts.get(gid, 0) + 1
+        first_row.setdefault(gid, i)
+
+    per_sample_keys = [
+        k for k, v in data.items() if k not in _STATIC_PAD_SKIP and isinstance(v, list) and len(v) == n
+    ]
+    unknown = [k for k in per_sample_keys if k not in _STATIC_PAD_FILLERS]
+    assert not unknown, (
+        f"pad_static_groups: no dummy filler for per-sample key(s) {unknown}; "
+        f"extend _STATIC_PAD_FILLERS (or _STATIC_PAD_SKIP) in dp_schedule.py."
+    )
+
+    n_pad = 0
+    for gid, count in counts.items():
+        short = -count % unit
+        for _ in range(short):
+            i = first_row[gid]
+            for key in per_sample_keys:
+                data[key].append(_STATIC_PAD_FILLERS[key](data, i))
+        n_pad += short
+    if n_pad:
+        logger.info(
+            f"static path: padded {n_pad} zero-loss dummy rows across {len(counts)} groups "
+            f"(unit={unit}) to satisfy fixed-size micro-batch alignment."
+        )

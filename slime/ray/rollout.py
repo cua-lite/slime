@@ -18,7 +18,7 @@ from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupCo
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils import logging_utils
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, pad_static_groups
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
@@ -771,6 +771,18 @@ class RolloutManager:
         regardless of how many training samples each group produced.
         """
         dp_size = self.train_parallel_config["dp_size"]
+
+        # Static path (fixed ``micro_batch_size``, e.g. bshd/GDN): each step's
+        # micro-batch count must be a multiple of ``dp_size * mb_group`` and
+        # the packer can neither split nor merge fixed-size bins (see
+        # ``build_dp_schedule``), so the DATA must arrive aligned. Pad every
+        # group with zero-loss dummy rows up to a multiple of
+        # ``dp * micro_batch_size * mb_group`` — any whole-group step
+        # composition then divides evenly. This single chokepoint covers the
+        # native converter AND any custom convert function. No-op on the
+        # dynamic path (elastic bins split/merge to align).
+        pad_static_groups(self.args, self.train_parallel_config, data)
+
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
