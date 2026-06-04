@@ -47,6 +47,7 @@ def assert_invariants(
     expected_global_sample_indices,
     total_lengths,
     max_per_bin=None,
+    allowed_merged_overshoot=0,
 ):
     """Check the invariants documented at the top of dp_schedule.py.
 
@@ -74,13 +75,20 @@ def assert_invariants(
     if max_per_bin is None:
         return
 
-    # Every mbs <= max_per_bin tokens, EXCEPT a singleton bin holding an oversized sample.
+    # Every mbs <= max_per_bin tokens, EXCEPT singleton bins holding an
+    # oversized sample and up to ``allowed_merged_overshoot`` multi-sample bins
+    # produced by the merge-down alignment fallback.
+    overshoot_multi = 0
     for r in range(dp_size):
         partition = partitions[r]
         for mbs in micro_batch_indices[r]:
             bin_total = sum(total_lengths[partition[i]] for i in mbs)
-            if bin_total > max_per_bin:
-                assert len(mbs) == 1, f"rank {r}: mbs sum {bin_total} > {max_per_bin} but contains {len(mbs)} samples"
+            if bin_total > max_per_bin and len(mbs) > 1:
+                overshoot_multi += 1
+    assert overshoot_multi <= allowed_merged_overshoot, (
+        f"{overshoot_multi} multi-sample mbs exceed max_per_bin "
+        f"(allowed: {allowed_merged_overshoot})"
+    )
 
 
 @pytest.mark.unit
@@ -276,6 +284,159 @@ def test_trims_trailing_groups_that_dont_fill_a_step():
         total_lengths=total_lengths,
         max_per_bin=12,
     )
+
+
+@pytest.mark.unit
+def test_dynamic_singleton_bins_merge_down_to_align():
+    """Splitting-saturated fallback: max_per_bin < 2x sample length packs 1
+    sample/bin, so 11 bins cannot split UP to 12 (dp=4); the scheduler must
+    merge DOWN to 8 instead of asserting."""
+    total_lengths = [1900] * 11
+    group_indices = list(range(11))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=2048)
+    tp = make_tp(dp_size=4)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=11, group_indices=group_indices
+    )
+
+    assert nmb == [2]  # 8 mbs / 4 ranks
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=4,
+        expected_global_sample_indices=range(11),
+        total_lengths=total_lengths,
+        max_per_bin=2048,
+        allowed_merged_overshoot=3,  # 11 -> 8 needs 3 merges
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_partial_split_then_merge_down():
+    """Mixed initial bins: expand splits the multi-sample bins first, SATURATES
+    below the up-target (every bin now a singleton), then the merge fallback
+    rounds down. 2 small samples pack into 1 bin + 9 singletons = 10 bins;
+    up-target 12 is unreachable (max 11 after splitting the pair), so expect
+    merge down to 8 with all 11 samples kept."""
+    total_lengths = [500, 500] + [1900] * 9
+    group_indices = list(range(11))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=2048)
+    tp = make_tp(dp_size=4)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=11, group_indices=group_indices
+    )
+
+    assert nmb == [2]  # 11 (post-split) -> merge down to 8 -> 2 per rank
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=4,
+        expected_global_sample_indices=range(11),
+        total_lengths=total_lengths,
+        max_per_bin=2048,
+        allowed_merged_overshoot=3,
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_merge_only_in_unaligned_steps():
+    """Multi-step rollout where step 0 aligns by itself (8 segments) and step 1
+    needs the merge fallback (7 segments -> 4 bins): per-step counts must be
+    independent and every sample kept."""
+    # 2 steps x 2 groups: groups 0,1 have 4 segments each (step 0: 8 = aligned);
+    # groups 2,3 have 4 + 3 (step 1: 7 -> merge down to 4).
+    group_indices = [0] * 4 + [1] * 4 + [2] * 4 + [3] * 3
+    n = len(group_indices)
+    total_lengths = [1900] * n
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=2048)
+    tp = make_tp(dp_size=4)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=2, group_indices=group_indices
+    )
+
+    assert gbs_per_step == [2, 2]
+    assert nmb == [2, 1]  # step 0: 8 bins untouched; step 1: 7 -> 4
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=4,
+        expected_global_sample_indices=range(n),
+        total_lengths=total_lengths,
+        max_per_bin=2048,
+        allowed_merged_overshoot=3,  # step 1: 7 -> 4 needs 3 merges
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_merge_down_production_repro():
+    """Regression for the android_world dp=4 crash: 203 ~1.9k-token segments
+    at max_tokens_per_gpu=2048 -> 203 singleton bins, up-target 204 unreachable.
+    Expect merge down to 200 (50 mbs/rank), all samples kept, <= 3 merged bins."""
+    n = 203
+    total_lengths = [1900] * n
+    group_indices = list(range(n))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=2048)
+    tp = make_tp(dp_size=4)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=n, group_indices=group_indices
+    )
+
+    assert nmb == [50]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=4,
+        expected_global_sample_indices=range(n),
+        total_lengths=total_lengths,
+        max_per_bin=2048,
+        allowed_merged_overshoot=3,
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_splittable_bins_still_split_not_merge():
+    """When bins hold 2 samples (max_per_bin >= 2x sample length), the up-split
+    path must still win: no bin may exceed the cap."""
+    total_lengths = [1900] * 10
+    group_indices = list(range(10))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=4096)
+    tp = make_tp(dp_size=4)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=10, group_indices=group_indices
+    )
+
+    assert nmb == [2]  # 5 bins split up to 8 -> 2 per rank
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=4,
+        expected_global_sample_indices=range(10),
+        total_lengths=total_lengths,
+        max_per_bin=4096,
+        allowed_merged_overshoot=0,
+    )
+
+
+@pytest.mark.unit
+def test_dynamic_merge_down_below_align_asserts():
+    """vpp edge: align_to = dp * mb_group = 4 but only 3 singleton bins ->
+    neither splitting up nor merging down can align; expect a loud error."""
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=2048)
+    tp = make_tp(dp_size=2, vpp_size=2, microbatch_group_size_per_vp_stage=2)
+    with pytest.raises(AssertionError, match="neither splitting up nor merging down"):
+        build_dp_schedule(
+            args, tp, [1900] * 3, global_batch_size=3, group_indices=[0, 1, 2]
+        )
 
 
 @pytest.mark.unit

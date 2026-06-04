@@ -18,7 +18,10 @@ The scheduling philosophy is **pack first, distribute second**:
      single first-fit pass (dynamic batch) or fixed-size chunking
      (static batch).
   3. Adjust ``K`` to a multiple of ``dp_size * (mb_group if vpp>1 else 1)``
-     by splitting the largest multi-sample bins (dynamic only).
+     by splitting the largest multi-sample bins (dynamic only). If splitting
+     saturates (every bin already a singleton — ``max_tokens_per_gpu`` < 2x
+     sample length), round DOWN to the previous multiple by merging the
+     smallest bins instead (<= align_to - 1 merges).
   4. Distribute the ``K`` mbs across ``dp_size`` ranks, ``K / dp_size``
      each, with either a strided round-robin or a Karmarkar-Karp pass on
      mbs token sums.
@@ -27,9 +30,10 @@ Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
   - every DP rank runs the **same** ``num_microbatches`` per training step
     (required for PP sync);
   - every mbs (dynamic path) holds ``<= max_tokens_per_gpu * cp_size``
-    tokens, with one exception — an individual sample larger than that cap
-    lands alone in its own mbs (and that mbs is the only one allowed to
-    exceed the cap);
+    tokens, with two exceptions — an individual sample larger than that cap
+    lands alone in its own mbs, and up to ``align_to - 1`` merged bins per
+    step (the splitting-saturated fallback above) may modestly exceed the
+    cap;
   - the union of per-rank sample indices equals the set of samples kept
     after trimming trailing groups (every kept sample placed exactly
     once);
@@ -43,7 +47,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from slime.utils.seqlen_balancing import expand_bins_by_splitting, first_fit_pack, get_seqlen_balanced_partitions
+from slime.utils.seqlen_balancing import (
+    expand_bins_by_splitting,
+    first_fit_pack,
+    get_seqlen_balanced_partitions,
+    merge_bins_down,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,11 +161,27 @@ def build_dp_schedule(
         if target_K != len(step_mbs):
             if args.use_dynamic_batch_size:
                 expand_bins_by_splitting(step_mbs, target_K, step_lengths)
-                assert len(step_mbs) == target_K, (
-                    f"dynamic path: could only produce {len(step_mbs)} mbs after maximal splitting; "
-                    f"need {target_K}. step {step_i} has {len(sample_indices)} samples, below the "
-                    f"alignment threshold ({align_to})."
-                )
+                if len(step_mbs) != target_K:
+                    # Splitting saturated (all bins singletons — happens when
+                    # ``max_tokens_per_gpu`` < 2x sample length, so first-fit
+                    # packing is already 1 sample/bin). Round DOWN to the
+                    # previous multiple by merging the smallest bins instead:
+                    # <= align_to - 1 merges, each bounded by the step's two
+                    # smallest samples.
+                    target_K_down = (len(step_mbs) // align_to) * align_to
+                    assert target_K_down >= align_to, (
+                        f"dynamic path: step {step_i} produced {len(step_mbs)} mbs from "
+                        f"{len(sample_indices)} samples — fewer than dp_size * mb_group "
+                        f"({align_to}); neither splitting up nor merging down can align. "
+                        f"Lower vpp/mb_group or raise global_batch_size."
+                    )
+                    logger.info(
+                        f"dynamic path: step {step_i} cannot split {len(step_mbs)} mbs up to "
+                        f"{target_K} (all bins single-sample); merging down to {target_K_down}."
+                    )
+                    merge_bins_down(step_mbs, target_K_down, step_lengths)
+                    target_K = target_K_down
+                assert len(step_mbs) == target_K
             else:
                 raise AssertionError(
                     f"static path: num_mbs ({len(step_mbs)}) is not a multiple of "

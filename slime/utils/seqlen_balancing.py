@@ -229,6 +229,27 @@ def expand_bins_by_splitting(bins: list[list[int]], target_count: int, lengths) 
         bins.append(right)
 
 
+def merge_bins_down(bins: list[list[int]], target_count: int, lengths) -> None:
+    """Shrink ``bins`` in place to ``target_count`` by repeatedly merging the two
+    smallest-token bins.
+
+    Fallback for :func:`expand_bins_by_splitting`: when bins are (mostly)
+    singletons — e.g. ``max_tokens_per_gpu`` < 2x sample length, so first-fit
+    packing is already maximal — splitting cannot GROW the bin count to the next
+    aligned multiple. Rounding DOWN to the previous multiple needs at most
+    ``align_to - 1`` merges; merging the two smallest-token bins each time keeps
+    the overshoot past ``max_tokens_per_gpu`` minimal and bounded (~2x the
+    smallest samples in the step) rather than systematic.
+    """
+    while len(bins) > target_count:
+        sums = sorted((sum(lengths[i] for i in b), idx) for idx, b in enumerate(bins))
+        _, i1 = sums[0]
+        _, i2 = sums[1]
+        lo, hi = min(i1, i2), max(i1, i2)
+        bins[lo] = bins[lo] + bins[hi]
+        del bins[hi]
+
+
 def get_reverse_idx(idx_map):
     reverse_idx_map = copy.deepcopy(idx_map)
 
