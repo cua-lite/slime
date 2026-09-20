@@ -970,10 +970,26 @@ def policy_loss_function(
     #   clip/dual_clip_frac:     A<0, ratio > eps_clip_c       (dual-clip cap fully engaged)
     with torch.no_grad():
         _ratio = (-ppo_kl).exp()
+
+        def _empty_safe_max(t: torch.Tensor) -> torch.Tensor:
+            """``t.max()`` that survives an empty rank.
+
+            ``dp_schedule`` pads a data-parallel rank with zero-loss dummies, so a
+            rank can arrive here holding no tokens at all. Bare ``max()`` raises on
+            ``numel() == 0`` ("Expected reduction dim to be specified"), which kills
+            the whole train step. Every other entry in ``diag`` is a sum or a
+            sample-mean and already yields 0 on empty input; these two maxima were
+            the only ones that could not. They are diagnostics — never in the
+            gradient path — so an empty rank reports 0 rather than aborting.
+            """
+            if t.numel() == 0:
+                return torch.zeros((), dtype=t.dtype, device=t.device)
+            return t.max()
+
         diag = {
-            "ratio_max": _ratio.max().detach(),
+            "ratio_max": _empty_safe_max(_ratio).detach(),
             "ratio_mean": sum_of_sample_mean(_ratio).detach(),
-            "adv_abs_max": advantages.abs().max().detach(),
+            "adv_abs_max": _empty_safe_max(advantages.abs()).detach(),
             "clip/pg_pos_frac": sum_of_sample_mean(
                 ((_ratio > 1 + args.eps_clip_high) & (advantages > 0)).float()
             ).detach(),
