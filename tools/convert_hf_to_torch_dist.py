@@ -15,6 +15,7 @@ from slime.backends.megatron_utils.arguments import set_default_megatron_args
 from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 from slime.utils.logging_utils import configure_logger
+from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.memory_utils import print_memory
 
 
@@ -113,11 +114,40 @@ def main():
 
     model = get_model(get_model_provider_func(args), ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
-    # Load model
+    # Load model.
+    #
+    # The weights have to come from the SAME bridge that built the model.
+    # ``get_model_provider_func`` honours ``--megatron-to-hf-mode``: under
+    # ``bridge`` it builds the provider from ``megatron.bridge`` with
+    # ``patch_auto_bridge_hf_config``, which is what reaches a multimodal
+    # checkpoint's nested ``text_config``. Loading those weights through
+    # ``mbridge`` regardless -- as this did -- pairs a model built one way with
+    # a weight map produced another way. Measured on a Qwen3.5-VL export (738
+    # tensors, 441 language + 297 vision): ``mbridge`` raises
+    # ``ValueError: Unregistered model type: qwen3_5`` -- its registry stops at
+    # ``qwen2_5_vl`` / ``qwen3`` -- so this tool could never convert a Qwen3.5
+    # checkpoint at all, while ``megatron.bridge`` reports ``can_handle=True``
+    # and reads the nested ``text_config`` (32 layers, rope_theta hoisted by
+    # ``patch_auto_bridge_hf_config``). Training never hit this because
+    # ``model_provider`` uses one bridge end to end.
+    #
+    # The two APIs differ, so each branch calls its own: ``megatron.bridge``
+    # exposes ``load_hf_weights(model, hf_path)`` and has no ``memory_efficient``
+    # flag; ``mbridge`` exposes ``load_weights(models, path, memory_efficient=)``.
     hf_model_path = args.hf_checkpoint
-    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
-    bridge.load_weights(model, hf_model_path, memory_efficient=True)
-    print(f"Model loaded: {hf_model_path}")
+    if args.megatron_to_hf_mode == "bridge":
+        from megatron.bridge import AutoBridge as MegatronAutoBridge
+
+        import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
+
+        bridge = patch_auto_bridge_hf_config(
+            MegatronAutoBridge.from_hf_pretrained(hf_model_path, trust_remote_code=True)
+        )
+        bridge.load_hf_weights(model, hf_model_path)
+    else:
+        bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+        bridge.load_weights(model, hf_model_path, memory_efficient=True)
+    print(f"Model loaded: {hf_model_path} (mode={args.megatron_to_hf_mode})")
 
     if args.use_cpu_initialization:
         model[0] = model[0].cpu()
