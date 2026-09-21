@@ -240,6 +240,19 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.qkv_format == "bshd":
             # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
+            # ``rollout_data`` is already this rank's shard (process_rollout_data
+            # above takes dp_rank / dp_world_size), and ``pad_static_groups`` is
+            # what guarantees every rank receives at least one row. If that
+            # invariant ever breaks, bare ``max()`` raises "max() arg is an empty
+            # sequence", which says nothing about which rank or why; name the
+            # invariant instead. No default value: a fabricated max_seq_len would
+            # pad garbage into the batch rather than fail.
+            if not rollout_data["total_lengths"]:
+                raise RuntimeError(
+                    f"data-parallel rank {mpu.get_data_parallel_rank(with_context_parallel=False)} "
+                    f"received zero rows; pad_static_groups (dp_schedule.py) is supposed to keep "
+                    f"every rank non-empty"
+                )
             max_seq_len = max(rollout_data["total_lengths"])
 
             # pad to reduce memory fragmentation and maybe make the computation faster

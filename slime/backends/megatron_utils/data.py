@@ -112,6 +112,17 @@ def get_batch(
             # thd requires the cu_seqlens to be of the origin length
             cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
 
+        # cu_seqlens is [0] plus one cumulative offset per packed sequence, so the
+        # diff is empty exactly when this rank packed no sequence at all. Bare
+        # ``max()`` then raises the opaque "Expected reduction dim to be specified";
+        # name the invariant (pad_static_groups keeps every rank non-empty) rather
+        # than inventing a max_seqlen, which would silently mis-shape attention.
+        if cu_seqlens.numel() < 2:
+            raise RuntimeError(
+                "packed micro-batch has no sequence (cu_seqlens="
+                f"{cu_seqlens.tolist()}); pad_static_groups (dp_schedule.py) is "
+                "supposed to keep every data-parallel rank non-empty"
+            )
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
